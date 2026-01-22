@@ -229,7 +229,11 @@ class DataPointValidator:
         """
         try:
             import docker
-            from swebench.harness.run_evaluation import run_instance, make_test_spec
+            from swebench.harness.run_evaluation import (
+                run_instance,
+                make_test_spec,
+                build_env_images,
+            )
             from swebench.harness.constants import RUN_EVALUATION_LOG_DIR
         except ImportError as e:
             raise ImportError(
@@ -251,6 +255,19 @@ class DataPointValidator:
             test_spec = make_test_spec(data_point)
         except Exception as e:
             raise RuntimeError(f"Failed to create test spec: {e}") from e
+
+        # Build environment image if it doesn't exist
+        logger.info(f"Building environment image if needed for {prediction['instance_id']}")
+        try:
+            build_env_images(
+                client=client,
+                dataset=[data_point],
+                force_rebuild=False,
+                max_workers=1,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to build environment image: {e}")
+            # Continue anyway, run_instance might handle it
 
         # Set up logging directory
         run_id = f"validate_{prediction['instance_id']}"
