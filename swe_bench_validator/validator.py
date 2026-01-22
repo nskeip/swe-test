@@ -268,6 +268,11 @@ class DataPointValidator:
                 run_id=run_id,
                 timeout=self.timeout,
             )
+
+            # Handle case where run_instance returns None
+            if result is None:
+                raise RuntimeError("Evaluation returned no results. This may indicate a Docker or environment setup issue.")
+
             return result
         except Exception as e:
             logger.error(f"Evaluation execution failed: {e}", exc_info=True)
