@@ -286,11 +286,21 @@ class DataPointValidator:
                 timeout=self.timeout,
             )
 
-            # Handle case where run_instance returns None
+            # Handle case where run_instance returns None (error occurred)
             if result is None:
-                raise RuntimeError("Evaluation returned no results. This may indicate a Docker or environment setup issue.")
+                raise RuntimeError("Evaluation returned no results. Check logs for details.")
 
-            return result
+            # run_instance returns a tuple: (instance_id, report_dict)
+            if isinstance(result, tuple) and len(result) == 2:
+                instance_id, report = result
+                logger.info(f"Evaluation completed for {instance_id}")
+                return report
+
+            # If it's already a dict (shouldn't happen, but handle it)
+            if isinstance(result, dict):
+                return result
+
+            raise RuntimeError(f"Unexpected result type from run_instance: {type(result)}")
         except Exception as e:
             logger.error(f"Evaluation execution failed: {e}", exc_info=True)
             raise RuntimeError(f"Failed to run evaluation: {e}") from e
