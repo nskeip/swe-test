@@ -3,6 +3,7 @@
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
@@ -38,7 +39,7 @@ class ValidationResult:
         }
 
 
-class DataPointValidator:
+class SWEBenchValidator:
     """Validates SWE-bench data points using the official evaluation harness."""
 
     def __init__(
@@ -229,12 +230,8 @@ class DataPointValidator:
         """
         try:
             import docker
-            from swebench.harness.run_evaluation import (
-                run_instance,
-                make_test_spec,
-                build_env_images,
-            )
-            from swebench.harness.constants import RUN_EVALUATION_LOG_DIR
+            from swebench.harness.docker_build import build_env_images, build_instance_images
+            from swebench.harness.run_evaluation import run_instances
         except ImportError as e:
             raise ImportError(
                 "SWE-bench library or docker not found. Install with: pip install swebench docker"
@@ -250,14 +247,8 @@ class DataPointValidator:
                 f"Failed to connect to Docker. Is Docker running? Error: {e}"
             ) from e
 
-        # Create TestSpec from data point
-        try:
-            test_spec = make_test_spec(data_point)
-        except Exception as e:
-            raise RuntimeError(f"Failed to create test spec: {e}") from e
-
-        # Build environment image if it doesn't exist
-        logger.info(f"Building environment image if needed for {prediction['instance_id']}")
+        # Build environment image (repo-level dependencies)
+        logger.info(f"Building environment image for {data_point['repo']}")
         try:
             build_env_images(
                 client=client,
@@ -267,43 +258,69 @@ class DataPointValidator:
             )
         except Exception as e:
             logger.warning(f"Failed to build environment image: {e}")
-            # Continue anyway, run_instance might handle it
+            # Continue anyway, might still work
 
-        # Set up logging directory
-        run_id = f"validate_{prediction['instance_id']}"
-        log_dir = Path(RUN_EVALUATION_LOG_DIR) / run_id
-        log_dir.mkdir(parents=True, exist_ok=True)
-
-        # Run evaluation
+        # Build instance image (specific commit + test setup)
+        logger.info(f"Building instance image for {prediction['instance_id']}")
         try:
-            result = run_instance(
-                test_spec=test_spec,
-                pred=prediction,
-                rm_image=(self.cache_level != "instance"),
-                force_rebuild=False,
+            build_instance_images(
                 client=client,
+                dataset=[data_point],
+                force_rebuild=False,
+                max_workers=1,
+                namespace="swebench",
+                tag="latest",
+            )
+        except Exception as e:
+            logger.warning(f"Failed to build instance image: {e}")
+            # Continue anyway
+
+        # Generate unique run ID
+        run_id = f"validate_{prediction['instance_id']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        # Run evaluation using run_instances (plural)
+        logger.info("Running evaluation in Docker container")
+        try:
+            run_instances(
+                predictions={data_point["instance_id"]: prediction},
+                instances=[data_point],
+                cache_level=self.cache_level,
+                clean=False,
+                force_rebuild=False,
+                max_workers=1,
                 run_id=run_id,
                 timeout=self.timeout,
+                namespace="swebench",
+                instance_image_tag="latest",
             )
-
-            # Handle case where run_instance returns None (error occurred)
-            if result is None:
-                raise RuntimeError("Evaluation returned no results. Check logs for details.")
-
-            # run_instance returns a tuple: (instance_id, report_dict)
-            if isinstance(result, tuple) and len(result) == 2:
-                instance_id, report = result
-                logger.info(f"Evaluation completed for {instance_id}")
-                return report
-
-            # If it's already a dict (shouldn't happen, but handle it)
-            if isinstance(result, dict):
-                return result
-
-            raise RuntimeError(f"Unexpected result type from run_instance: {type(result)}")
         except Exception as e:
             logger.error(f"Evaluation execution failed: {e}", exc_info=True)
             raise RuntimeError(f"Failed to run evaluation: {e}") from e
+
+        # Read the report from disk (run_instances writes to logs/)
+        report_path = (
+            Path("logs")
+            / "run_evaluation"
+            / run_id
+            / prediction["model_name_or_path"]
+            / data_point["instance_id"]
+            / "report.json"
+        )
+
+        if not report_path.exists():
+            raise RuntimeError(f"Evaluation report not found at {report_path}")
+
+        logger.info(f"Reading evaluation report from {report_path}")
+        with open(report_path) as f:
+            full_report = json.load(f)
+
+        # Extract the report for this specific instance
+        if data_point["instance_id"] not in full_report:
+            raise RuntimeError(
+                f"Instance {data_point['instance_id']} not found in report"
+            )
+
+        return full_report[data_point["instance_id"]]
 
     def _check_test_results(
         self, eval_result: dict, data_point: dict, json_path: Path
@@ -319,7 +336,7 @@ class DataPointValidator:
         instance_id = data_point["instance_id"]
 
         # Check if patch was applied
-        patch_applied = eval_result.get("patch_applied", False)
+        patch_applied = eval_result.get("patch_successfully_applied", False)
         if not patch_applied:
             return ValidationResult(
                 instance_id=instance_id,
@@ -338,7 +355,14 @@ class DataPointValidator:
         pass_to_pass_list = self._parse_test_list(data_point["PASS_TO_PASS"])
 
         # Get actual test results from evaluation
-        test_output = eval_result.get("test_output", {})
+        tests_status = eval_result.get("tests_status", {})
+
+        # Extract failure information
+        fail_to_pass_status = tests_status.get("FAIL_TO_PASS", {})
+        fail_to_pass_failures = fail_to_pass_status.get("failure", [])
+
+        pass_to_pass_status = tests_status.get("PASS_TO_PASS", {})
+        pass_to_pass_failures = pass_to_pass_status.get("failure", [])
 
         fail_to_pass_results = {}
         pass_to_pass_results = {}
@@ -346,8 +370,16 @@ class DataPointValidator:
         # If resolved is False, determine why
         if not resolved:
             error_message = self._build_error_message(
-                eval_result, fail_to_pass_list, pass_to_pass_list
+                eval_result, fail_to_pass_list, pass_to_pass_list,
+                fail_to_pass_failures, pass_to_pass_failures
             )
+
+            # Build detailed test results
+            for test in fail_to_pass_list:
+                fail_to_pass_results[test] = "FAILED" if test in fail_to_pass_failures else "PASSED"
+
+            for test in pass_to_pass_list:
+                pass_to_pass_results[test] = "FAILED" if test in pass_to_pass_failures else "PASSED"
 
             return ValidationResult(
                 instance_id=instance_id,
@@ -382,7 +414,12 @@ class DataPointValidator:
         return test_spec
 
     def _build_error_message(
-        self, eval_result: dict, fail_to_pass: List[str], pass_to_pass: List[str]
+        self,
+        eval_result: dict,
+        fail_to_pass: List[str],
+        pass_to_pass: List[str],
+        fail_to_pass_failures: List[str],
+        pass_to_pass_failures: List[str],
     ) -> str:
         """Build detailed error message from evaluation results."""
         messages = []
@@ -392,16 +429,29 @@ class DataPointValidator:
             messages.append(f"Evaluation error: {eval_result['error']}")
 
         # Analyze test failures
-        messages.append(
-            f"Tests did not pass as expected. "
-            f"Expected {len(fail_to_pass)} FAIL_TO_PASS tests to pass and "
-            f"{len(pass_to_pass)} PASS_TO_PASS tests to remain passing."
-        )
+        if fail_to_pass_failures:
+            messages.append(
+                f"FAIL_TO_PASS tests still failing: {len(fail_to_pass_failures)}/{len(fail_to_pass)}"
+            )
+            for test in fail_to_pass_failures[:3]:  # Show first 3
+                messages.append(f"  - {test}")
+            if len(fail_to_pass_failures) > 3:
+                messages.append(f"  ... and {len(fail_to_pass_failures) - 3} more")
 
-        # Add any additional context from eval_result
-        if "test_output" in eval_result:
-            output = eval_result["test_output"]
-            if isinstance(output, str) and len(output) < 500:
-                messages.append(f"Test output: {output}")
+        if pass_to_pass_failures:
+            messages.append(
+                f"PASS_TO_PASS tests broken: {len(pass_to_pass_failures)}/{len(pass_to_pass)}"
+            )
+            for test in pass_to_pass_failures[:3]:  # Show first 3
+                messages.append(f"  - {test}")
+            if len(pass_to_pass_failures) > 3:
+                messages.append(f"  ... and {len(pass_to_pass_failures) - 3} more")
+
+        if not fail_to_pass_failures and not pass_to_pass_failures:
+            messages.append(
+                f"Tests did not pass as expected. "
+                f"Expected {len(fail_to_pass)} FAIL_TO_PASS tests to pass and "
+                f"{len(pass_to_pass)} PASS_TO_PASS tests to remain passing."
+            )
 
         return " ".join(messages)

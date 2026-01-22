@@ -7,7 +7,7 @@ from typing import List, Optional
 import click
 from rich.console import Console
 
-from .validator import DataPointValidator
+from .validator import SWEBenchValidator, ValidationResult
 from .results import ResultFormatter
 
 
@@ -109,7 +109,7 @@ def main(
 
     # Create validator
     console.print("[cyan]Initializing SWE-bench validator...[/cyan]")
-    validator = DataPointValidator(
+    validator = SWEBenchValidator(
         timeout=timeout,
         cache_level=cache_level,
         max_workers=max_workers,
