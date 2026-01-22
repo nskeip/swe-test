@@ -1,0 +1,149 @@
+name: Validate Data Points
+
+on:
+  push:
+    paths:
+      - 'data_points/**/*.json'
+  pull_request:
+    paths:
+      - 'data_points/**/*.json'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120  # 2 hours max for validation
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history for git diff
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install UV package manager
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install project dependencies
+        run: |
+          uv sync
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Detect changed data point files
+        id: changed-files
+        uses: tj-actions/changed-files@v44
+        with:
+          files: 'data_points/**/*.json'
+          separator: ' '
+
+      - name: Display changed files
+        if: steps.changed-files.outputs.any_changed == 'true'
+        run: |
+          echo "Changed files:"
+          echo "${{ steps.changed-files.outputs.all_changed_files }}"
+
+      - name: Validate changed data points
+        if: steps.changed-files.outputs.any_changed == 'true'
+        run: |
+          echo "Running validation on changed data points..."
+
+          # Convert space-separated files to individual --files arguments
+          FILES="${{ steps.changed-files.outputs.all_changed_files }}"
+          FILE_ARGS=""
+          for file in $FILES; do
+            FILE_ARGS="$FILE_ARGS --files $file"
+          done
+
+          # Run validator with JSON output
+          uv run python -m swe_bench_validator \
+            $FILE_ARGS \
+            --json-output results.json \
+            --verbose
+
+      - name: Upload validation results
+        if: always() && steps.changed-files.outputs.any_changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-results
+          path: |
+            results.json
+            .validation_logs/
+
+      - name: Check validation results
+        if: always() && steps.changed-files.outputs.any_changed == 'true'
+        run: |
+          echo "Validation Results:"
+          cat results.json | python -m json.tool
+
+          # Check if any validations failed
+          if grep -q '"is_valid": false' results.json; then
+            echo ""
+            echo "❌ Validation failed for one or more data points"
+            echo ""
+            echo "Failed data points:"
+            cat results.json | python -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          for result in data.get('results', []):
+              if not result['is_valid']:
+                  print(f\"  - {result['instance_id']}: {result['error_type']} - {result['error_message']}\")
+          "
+            exit 1
+          fi
+
+          echo "✅ All data points validated successfully!"
+
+      - name: Comment PR with results
+        if: always() && github.event_name == 'pull_request' && steps.changed-files.outputs.any_changed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            try {
+              const results = JSON.parse(fs.readFileSync('results.json', 'utf8'));
+
+              const total = results.total;
+              const valid = results.valid;
+              const invalid = results.invalid;
+
+              let comment = `## 🤖 SWE-bench Data Point Validation Results\n\n`;
+              comment += `**Summary:** ${valid}/${total} data points validated successfully\n\n`;
+
+              if (invalid > 0) {
+                comment += `### ❌ Failed Validations (${invalid})\n\n`;
+                results.results.filter(r => !r.is_valid).forEach(result => {
+                  comment += `#### ${result.instance_id}\n`;
+                  comment += `- **File:** \`${result.file_path}\`\n`;
+                  comment += `- **Error Type:** ${result.error_type}\n`;
+                  comment += `- **Message:** ${result.error_message}\n\n`;
+                });
+              } else {
+                comment += `### ✅ All Data Points Valid!\n\n`;
+                results.results.forEach(result => {
+                  comment += `- ✓ ${result.instance_id}\n`;
+                });
+              }
+
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: comment
+              });
+            } catch (error) {
+              console.log('Error posting comment:', error);
+            }
+
+      - name: No changes detected
+        if: steps.changed-files.outputs.any_changed != 'true'
+        run: |
+          echo "ℹ️  No data point files were changed in this commit"
+          echo "Skipping validation"
